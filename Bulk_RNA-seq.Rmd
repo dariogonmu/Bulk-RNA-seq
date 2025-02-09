@@ -1,0 +1,1061 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-02-05"
+---
+
+```{r}
+
+library("dplyr")
+library("stringr")
+
+## data viz
+library("ggplot2")
+library("ComplexHeatmap")
+library("ggpubr")
+library("RColorBrewer")
+
+## specific to RNA-seq
+library("edgeR")
+
+## gene annotation
+library("biomaRt")
+library("AnnotationDbi")
+library("dplyr")
+library("stringr")
+
+## viz
+library("ComplexHeatmap")
+library("ggplot2")
+
+## rna-seq
+library("edgeR")
+library("limma")
+library("org.Hs.eg.db")
+library("msigdb")
+library("clusterProfiler")
+library("fgsea")
+# project path
+projectPath <- getwd() 
+
+```
+
+Listamos los archivos con los que vamos a trabajar y con la función grep los agrupamos en una variable 'archivos' donde cogemos los que vamos a necesitar
+
+```{r}
+dataPath <- file.path(projectPath, "GSE111003_RAW")
+
+# Lista todos los archivos en el directorio
+all_files <- list.files(dataPath, full.names = TRUE)
+
+archivos <- all_files[
+  grepl("T0",all_files) |
+  grepl("BG",all_files) & grepl("4h",all_files) |
+  grepl("BG",all_files) & grepl("24h",all_files) |
+  grepl("RPMI",all_files) & grepl("4h",all_files) |
+  grepl("RPMI",all_files) & grepl("24h",all_files) |
+  grepl("BG_d6_LPS",all_files) & !grepl("\\.bw",all_files)
+]
+
+# Muestra los archivos filtrados
+
+
+```
+
+
+
+```{r}
+# Crear listas vacías para almacenar los datos de expresión, muestras y condiciones
+expresion_data <- list()
+muestras <- c()
+condiciones <- c()
+
+for (archivo in archivos) {
+  # Leer el archivo directamente
+  data <- tryCatch({
+    read.table(archivo, header = TRUE, stringsAsFactors = FALSE, sep = "\t", 
+               comment.char = "#", fill = TRUE)[, c("feature_id", "unique_hits")]
+  }, error = function(e) {
+    message("Error leyendo el archivo ", archivo, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (!is.null(data)) {
+    # Almacenar los datos
+    expresion_data[[archivo]] <- data
+    
+    # Extraer el nombre de la muestra
+    muestra_nombre <- sub(".*_(HD\\d+|RPMI\\d+)_.*", "\\1", archivo)
+    muestras <- c(muestras, muestra_nombre)
+    
+    # Determinar la condición con prioridad explícita
+    if (grepl("T0", archivo)) {
+      condiciones <- c(condiciones, "T0")
+    } else if (grepl("24h", archivo)) {
+      if (grepl("BG", archivo)) {
+        condiciones <- c(condiciones, "BG_24h")
+      } else if (grepl("RPMI", archivo)) {
+        condiciones <- c(condiciones, "RPMI_24h")
+      }
+    } else if (grepl("4h", archivo)) {
+      if (grepl("BG", archivo)) {
+        condiciones <- c(condiciones, "BG_4h")
+      } else if (grepl("RPMI", archivo)) {
+        condiciones <- c(condiciones, "RPMI_4h")
+      }
+    } else if (grepl("d6", archivo)) {
+      if (grepl("BG", archivo)) {
+        condiciones <- c(condiciones, "BG_d6")
+      } else if (grepl("RPMI", archivo)) {
+        condiciones <- c(condiciones, "RPMI_d6")
+      }
+    } else {
+      condiciones <- c(condiciones, "Unknown")
+    }
+  }
+}
+```
+
+Data frame de los metadatos
+
+```{r}
+samplesMetadata <- data.frame(
+  Sample.ID = paste(condiciones, muestras, sep = "_"),
+  Sample = muestras,
+  Treatment = ifelse(grepl("LPS", condiciones), "LPS", 
+                     ifelse(grepl("BG", condiciones), "BG", 
+                            ifelse(grepl("RPMI", condiciones), "RPMI", "Unknown"))),
+  Time = ifelse(grepl("24h", condiciones), "24h", 
+                ifelse(grepl("4h", condiciones), "4h", 
+                       ifelse(grepl("T0", condiciones), "0h", 
+                              ifelse(grepl("d6", condiciones), "d6", "Unknown"))))
+)
+
+# Asegurar que los Sample.ID sean únicos
+samplesMetadata$Sample.ID <- make.unique(samplesMetadata$Sample.ID)
+
+# Asignar el Sample.ID como rownames
+rownames(samplesMetadata) <- samplesMetadata$Sample.ID
+
+# Validar los datos
+samplesMetadata
+```
+
+Creamos la matriz de expresión final agregando los valores por expresión de cada muestra y condición
+
+
+```{r}
+# Crear la matriz de expresión final
+expresion_final <- data.frame(feature_id = unique(unlist(lapply(expresion_data, function(x) x$feature_id))))
+
+# Agregar los valores de expresión por cada muestra y condición
+for (i in 1:length(expresion_data)) {
+  # Extraer los datos para cada archivo
+  data <- expresion_data[[i]]
+  
+  # Crear el nombre de la columna correspondiente con la condición y la muestra
+  nombre_columna <- paste(condiciones[i], muestras[i], sep = "_")
+  
+  # Unir los valores de expresión con la tabla de genes
+  expresion_final <- merge(expresion_final, data[, c("feature_id", "unique_hits")], by = "feature_id", all.x = TRUE)
+  
+  # Renombrar la columna con el nombre de la muestra + condición
+  colnames(expresion_final)[ncol(expresion_final)] <- nombre_columna
+}
+
+# Ver las primeras filas de la matriz final
+head(expresion_final)
+```
+
+```{r}
+# Crear la matriz de expresión final como rawCounts
+rawCounts <- expresion_final[, -1]  # Eliminamos la columna feature_id
+rownames(rawCounts) <- expresion_final$feature_id
+
+# Mostrar la matriz de expresión (rawCounts)
+head(rawCounts)
+```
+Con este código vemos cuanto porcentaje de genes no tienen expresión
+
+```{r}
+message(
+  ">>> % of genes with no expression in any sample: ", 
+  ((sum(rowSums(rawCounts == 0) == ncol(rawCounts)) / nrow(rawCounts)) * 100) %>%
+    round(2)
+)
+```
+
+Eliminamos aquellos con 0 de expresión
+
+```{r}
+rawCounts <- rawCounts[rowSums(rawCounts == 0) != ncol(rawCounts), ]
+```
+
+```{r}
+rawCounts <- rawCounts[rowSums(rawCounts) > 1, ]
+```
+
+```{r}
+genes.to.keep <- filterByExpr(rawCounts, group = samplesMetadata$Treatment)
+```
+
+```{r}
+rawCounts.filt <- rawCounts[genes.to.keep, ]
+```
+
+Ploteamos un histograma, donde vemos que casi todo se acerca a cero, por lo que no sigue una normal
+
+```{r}
+hist(as.numeric(as.matrix(rawCounts.filt)), breaks = 100, main = "Histogram or raw counts (all samples together)", col = "lightblue")
+
+```
+
+
+
+```{r}
+cat("Library sizes:\n")
+cat("=== Mean lib. size", mean(colSums(rawCounts.filt)) * 1e-6, "\n")
+cat("=== Minimum lib size", min(colSums(rawCounts.filt)) * 1e-6, "\n")
+cat("=== Maximum lib size", max(colSums(rawCounts.filt)) * 1e-6, "\n")
+```
+ 
+```{r}
+# Crear un dataframe con los tamaños de biblioteca por muestra
+dfLibSize <- data.frame(
+  Lib.Size = round(colSums(rawCounts.filt) * 1e-6, 3)  # Filtrando genes de baja expresión
+) %>% cbind(samplesMetadata)
+
+# Visualizar los tamaños de biblioteca con ggplot2
+ggplot(dfLibSize, mapping = aes(x = Sample.ID, y = Lib.Size, fill = Treatment)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  scale_fill_manual(values = colorRampPalette(brewer.pal(8, "Set2"))(length(unique(dfLibSize$Treatment)))) + 
+  geom_text(
+    aes(label = Lib.Size), hjust = 0.5, vjust = 2, 
+    color = "white", size = 2.5
+  ) +
+  theme_minimal() + 
+  ggtitle("Library size per sample") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  ) 
+ 
+```
+ 
+Aquí hacemos la normalización intra muestral 
+ 
+ 
+```{r}
+# Calcular las cuentas por millón (CPM) antes y después del filtrado
+cpm.data <- cpm(rawCounts)
+log.cpm.data <- cpm(rawCounts, log = TRUE)
+cpm.filt.data <- cpm(rawCounts.filt)
+log.cpm.filt.data <- cpm(rawCounts.filt, log = T)
+```
+ 
+ 
+ 
+```{r}
+# Función para graficar densidades
+plotDensities2 <- function(
+  matrix, 
+  title = "", 
+  xlab = "",
+  ylim = 0.27,
+  cols = NULL, 
+  cutoff = NULL
+) {
+  nsamples <- ncol(matrix)
+  plot(density(matrix[, 1]), col = cols[1], 
+       lwd = 2, las = 1, ylim = c(0, ylim), main = "", xlab = "")
+  grid()
+  title(main = title, xlab = xlab)
+  if (!is.null(cutoff)) abline(v = cutoff, lty = 3)
+  for (i in 2:nsamples){
+    den <- density(matrix[, i])
+    lines(den$x, den$y, col = cols[i], lwd = 2)
+  }
+}
+
+# Definir colores
+sample_colors <- colorRampPalette(brewer.pal(8, "Dark2"))(ncol(rawCounts))
+
+```
+ 
+Ploteamos los CPM creados filtrados y sin filtrar junto con sus logaritmos
+ 
+```{r}
+# Configurar el layout de los gráficos
+par(mfrow = c(2, 2), mar = c(4.1, 4.1, 1.4, 1.8), mgp = c(2.1, 1, 0))
+
+# Graficar las densidades de CPM y logCPM antes y después del filtrado
+plotDensities2(
+  cpm.data, title = "A. CPMs before filtering",
+  xlab = "CPM", cols = sample_colors
+)
+plotDensities2(
+  cpm.filt.data, title = "B. CPMs after filtering",
+  xlab = "CPM", cols = sample_colors
+)
+plotDensities2(
+  log.cpm.data, title = "C. logCPMs before filtering",
+  xlab = "logCPM", cols = sample_colors
+)
+plotDensities2(
+  log.cpm.filt.data, title = "D. logCPMs after filtering",
+  xlab = "logCPM", cols = sample_colors
+)
+```
+
+
+Aquí hacemos la normalización inter muestral <- TMM
+
+```{r}
+# Crear el objeto DGEList con los datos filtrados
+DGEfiltData <- DGEList(
+  counts = rawCounts.filt,
+  samples = samplesMetadata,
+  group = samplesMetadata$Treatment  # Se usa Treatment en lugar de Condition
+)
+
+# Calcular factores de normalización con el método TMM
+DGEfiltData <- calcNormFactors(DGEfiltData, method = "TMM")
+
+# Obtener log-CPM normalizado con TMM
+lcpmTMM <- cpm(DGEfiltData, log = TRUE)
+
+# Mostrar una vista parcial de los datos normalizados
+lcpmTMM[1:10, 1:10]
+
+```
+
+
+Creamos un heatmap para visualización
+
+```{r}
+# Definir anotaciones de filas usando los metadatos disponibles
+ha <- rowAnnotation(
+  df = samplesMetadata %>% dplyr::select(Treatment, Time),
+  col = list(
+    Treatment = colorRampPalette(brewer.pal(8, "Set1"))(length(unique(samplesMetadata$Treatment))) %>%
+      setNames(unique(samplesMetadata$Treatment)),
+    Time = colorRampPalette(brewer.pal(8, "Blues"))(length(unique(samplesMetadata$Time))) %>%
+      setNames(unique(samplesMetadata$Time))
+  )
+)
+
+# Crear heatmap de los factores de normalización de TMM
+Heatmap(
+  DGEfiltData$samples[, "norm.factors", drop = FALSE],
+  name = "Norm. factors",  # Título de la leyenda
+  row_title = "Samples",
+  row_names_gp = gpar(fontsize = 7),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  show_column_names = FALSE,
+  heatmap_width = unit(70, "mm"),
+  column_title = "Norm. factors from TMM model",
+  
+  # Función para colorear los valores dentro del heatmap
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    value <- DGEfiltData$samples[i, "norm.factors"]
+    grid.text(
+      sprintf("%.2f", value), x, y, 
+      gp = gpar(fontsize = 8, col = ifelse(value < 1, "white", "black"))
+    )
+  },
+  
+  right_annotation = ha,  # Añadir anotaciones de Treatment y Time
+  border = TRUE
+)
+
+```
+
+
+```{r}
+par(mfrow = c(2, 2), mar = c(1.1, 4.1, 1.4, 1.8), mgp = c(1.1, 1, 0))
+
+# Asegurar que color.list() tenga suficientes colores para todas las muestras
+colores <- colorRampPalette(brewer.pal(8, "Set1"))(ncol(rawCounts.filt))
+
+# A. Raw counts
+boxplot(
+  rawCounts.filt, col = colores,
+  cex.axis = 0.7, las = 2, 
+  main = "A. Raw counts", cex.main = 0.9, xaxt='n'
+)
+
+# B. CPM
+boxplot(
+  cpm.filt.data, col = colores, 
+  cex.axis = 0.7, las = 2, 
+  main = "B. CPM", cex.main = 0.9, xaxt='n'
+)
+
+# C. Log-CPM con línea de la mediana
+boxplot(
+  log.cpm.filt.data, col = colores, 
+  cex.axis = 0.7, las = 2, 
+  main = "C. Log-CPM", cex.main = 0.9, xaxt='n'
+)
+abline(h = median(log.cpm.filt.data), col="blue")
+
+# D. TMM + Log-CPM con línea de la mediana
+boxplot(
+  lcpmTMM, col = colores,
+  cex.axis = 0.7, las = 2, 
+  main = "D. TMM + log-CPM", cex.main = 0.9, xaxt='n'
+)
+abline(h = median(lcpmTMM), col="blue")
+
+```
+
+```{r}
+plotPCA <- function(
+  pcaObject, col.points, shape.points = NULL, palette,
+  legend.col, point.size = 3, title = "", pcs = c(1, 2)
+){
+  ## Extraer la varianza explicada por cada componente principal
+  variance <- round(factoextra::get_eigenvalue(pcaObject)[pcs, 2], 1)
+  
+  ## Extraer los componentes principales
+  data <- data.frame(pcaObject[["x"]])
+
+  # Crear el gráfico PCA usando ggplot
+  p <- ggplot(data, aes(x = PC1, y = PC2, color = col.points, shape = shape.points)) +
+    geom_point(size = point.size) +
+    scale_color_manual(values = palette) +
+    scale_shape_manual(values = c(16, 17, 18)) +  # Puedes ajustar los valores de los shapes si es necesario
+    ggtitle(title) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      plot.title = element_text(face = "bold", size = 14),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10)
+    ) +
+    labs(
+      color = legend.col, 
+      shape = "Sample Type"
+    ) +
+    xlab(paste0("PC1: ", variance[1], "% variance")) +
+    ylab(paste0("PC2: ", variance[2], "% variance"))
+  
+  return(p)
+}
+
+```
+
+Realizmos la PCA
+
+```{r}
+PCA.scaled <- prcomp(scale(t(lcpmTMM)))
+
+# Imprimir un resumen de la PCA (varianza explicada por cada componente)
+summary(PCA.scaled)
+```
+Ploteamos las PCAs por treatment, time y sample
+
+```{r}
+library(RColorBrewer)
+
+# Generar una paleta de colores
+color_palette <- brewer.pal(8, "Set1")  # Cambia el número de colores si es necesario
+
+# Realizar la PCA con los datos de lcpmTMM
+PCA.scaled <- prcomp(scale(t(lcpmTMM)))
+
+# PCA por tratamiento (usando "Treatment" como categoría)
+p1 <- plotPCA(
+  pcaObject = PCA.scaled, 
+  col.points = as.factor(samplesMetadata$Treatment),
+  palette = color_palette,  # Usamos la paleta generada
+  legend.col = "Treatment",
+  title = "PCA by treatment"
+)
+
+# PCA por tiempo (usando "Time" como categoría)
+p2 <- plotPCA(
+  pcaObject = PCA.scaled, 
+  col.points = as.factor(samplesMetadata$Time),
+  palette = color_palette,
+  legend.col = "Time",
+  title = "PCA by time"
+)
+
+# PCA por muestra (usando "Sample" como categoría)
+p3 <- plotPCA(
+  pcaObject = PCA.scaled, 
+  col.points = as.factor(samplesMetadata$Sample),
+  palette = color_palette,
+  legend.col = "Sample",
+  title = "PCA by sample"
+)
+
+# Combinar todos los gráficos en una cuadrícula de 2x2
+pt <- ggpubr::ggarrange(
+  plotlist = list(p1, p2, p3), 
+  labels = LETTERS[1:3],
+  ncol = 2, nrow = 2
+)
+
+# Añadir un título global para la figura
+annotate_figure(
+  pt, 
+  top = text_grob("PCA of main changes (data scaled)", face = "bold", size = 14)
+)
+
+```
+
+Como sabemos, el primer PC explica más que el siguiente, y así 
+
+```{r}
+factoextra::fviz_eig(PCA.scaled) + ggtitle("Explained variance") + 
+  theme(plot.title = element_text(face = "bold"))
+```
+Printeamos los genes más influyentes en las 2 primeras PCs
+
+```{r}
+
+mm.scaled <- PCA.scaled$rotation[, 1:2] %>% apply(
+  2, \(x) {
+    # Para cada componente (columna de PCA), tomamos los 10 genes con mayor y menor contribución
+    c(
+      names(x)[order(x, decreasing = TRUE)] %>% head(10),  # 10 genes con mayor contribución positiva
+      names(x)[order(x, decreasing = FALSE)] %>% head(10)  # 10 genes con mayor contribución negativa
+    )
+  }
+)
+
+# Ver los resultados, que serán los nombres de los genes más influyentes en las 2 primeras componentes principales
+mm.scaled
+
+```
+
+```{r}
+lcpmTMM[mm.scaled[1:5, 1], ] %>% t() %>% summary()
+```
+
+
+
+Heatmap con distancias euclideas
+
+
+
+```{r, fig.width=12, fig.height=10}
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(dplyr)
+
+# Función para generar colores usando RColorBrewer
+generate_colors <- function(factor_levels, palette = "Set2") {
+  brewer.pal(min(length(factor_levels), 8), palette) %>% setNames(factor_levels)
+}
+
+# Calcular distancias euclidianas
+sampleDists <- dist(t(lcpmTMM), method = "euclidean")
+
+# Crear anotaciones para la heatmap
+ha <- HeatmapAnnotation(
+  df = samplesMetadata %>% dplyr::select(
+    Sample, Treatment, Time
+  ),
+  col = list(
+    Sample = generate_colors(unique(samplesMetadata$Sample)),
+    Treatment = generate_colors(unique(samplesMetadata$Treatment)),
+    Time = generate_colors(unique(samplesMetadata$Time))
+  )
+)
+
+# Crear heatmap con distancias euclidianas
+Heatmap(
+  as.matrix(sampleDists),
+  name = "Euclidean\ndistance", 
+  row_names_gp = gpar(fontsize = 10),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  show_column_names = FALSE,
+  heatmap_width = unit(240, "mm"),
+  heatmap_height = unit(200, "mm"),
+  column_title = "Euclidean distances in transcriptional space",
+  top_annotation = ha,
+  border = TRUE,
+  col = colorRampPalette(rev(brewer.pal(9, "Blues")))(200)
+)
+
+```
+
+Heatmap con la correlacion de Pearson
+
+
+```{r, fig.width=12, fig.height=10}
+cor.pearson <- cor(lcpmTMM, method = "pearson") 
+
+# Crear la anotación del heatmap sin Replicate y sin color.list()
+ha <- HeatmapAnnotation(
+  df = samplesMetadata %>% dplyr::select(Sample, Treatment, Time),
+  col = list(
+    Sample = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Sample)), "Set3"),
+                      unique(samplesMetadata$Sample)),
+    Treatment = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Treatment)), "Set2"),
+                         unique(samplesMetadata$Treatment)),
+    Time = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Time)), "Paired"),
+                    unique(samplesMetadata$Time))
+  )
+)
+
+# Graficar el heatmap con Pearson's correlation
+Heatmap(
+  cor.pearson,
+  name = "Pearson's\ncorrelation", 
+  row_names_gp = gpar(fontsize = 10),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  show_column_names = FALSE,
+  heatmap_width = unit(240, "mm"),
+  heatmap_height = unit(200, "mm"),
+  column_title = "Pearson's correlations in transcriptional space",
+  top_annotation = ha,
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(
+      sprintf("%.2f", cor.pearson[i, j]), x, y, 
+      gp = gpar(fontsize = 8, col = "black")
+    )
+  }
+)
+
+```
+
+
+Heatmap en el espacio de la PCA
+
+```{r, fig.width=12, fig.height=10}
+sampleDists <- dist(PCA.scaled$x, method = "euclidean") 
+
+# Crear la anotación del heatmap 
+ha <- HeatmapAnnotation(
+  df = samplesMetadata %>% dplyr::select(Sample, Treatment, Time),
+  col = list(
+    Sample = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Sample)), "Set3"),
+                      unique(samplesMetadata$Sample)),
+    Treatment = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Treatment)), "Set2"),
+                         unique(samplesMetadata$Treatment)),
+    Time = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Time)), "Paired"),
+                    unique(samplesMetadata$Time))
+  )
+)
+
+# Graficar el heatmap con las distancias euclidianas en el espacio PCA
+Heatmap(
+  as.matrix(sampleDists),
+  name = "Euclidean\ndistance", 
+  row_names_gp = gpar(fontsize = 10),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  show_column_names = FALSE,
+  heatmap_width = unit(240, "mm"),
+  heatmap_height = unit(200, "mm"),
+  column_title = "Euclidean distances in PCA space",
+  top_annotation = ha,
+  border = TRUE,
+  col = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(200)
+)
+
+```
+
+Lo mismo con la correlación de Pearson
+
+```{r, fig.width=12, fig.height=10}
+cor.spearman <- cor(t(PCA.scaled$x), method = "pearson") 
+
+# Crear la anotación del heatmap sin Replicate, Cell_type y Condition
+ha <- HeatmapAnnotation(
+  df = samplesMetadata %>% dplyr::select(Sample, Treatment, Time),
+  col = list(
+    Sample = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Sample)), "Set3"),
+                      unique(samplesMetadata$Sample)),
+    Treatment = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Treatment)), "Set2"),
+                         unique(samplesMetadata$Treatment)),
+    Time = setNames(RColorBrewer::brewer.pal(length(unique(samplesMetadata$Time)), "Paired"),
+                    unique(samplesMetadata$Time))
+  )
+)
+
+# Graficar el heatmap con las correlaciones de Pearson
+Heatmap(
+  cor.spearman,
+  name = "Pearson's\ncorrelation", 
+  row_names_gp = gpar(fontsize = 10),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  show_column_names = FALSE,
+  heatmap_width = unit(240, "mm"),
+  heatmap_height = unit(200, "mm"),
+  column_title = "Pearson's correlations in PCA space",
+  top_annotation = ha,
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(
+      sprintf("%.2f", cor.spearman[i, j]), x, y, 
+      gp = gpar(fontsize = 8, col = "black")
+    )
+  }
+)
+
+```
+
+
+Añadimos la columna condition a samplesMetadata para trabajar la expresión diferencial
+
+```{r}
+samplesMetadata$condition <- interaction(samplesMetadata$Treatment, samplesMetadata$Time, sep = "_")
+
+```
+
+
+Aquí trabajamos con el contraste `conditionUnknown_0h` - `conditionBG_4h`y hacemos histograma y volcano plot
+
+```{r}
+# Cargar paquetes necesarios
+library(limma)
+library(edgeR)
+
+# Crear matriz de diseño (modelo lineal)
+design <- model.matrix(~ 0 + condition, data = samplesMetadata)
+
+# Ajustar el modelo lineal con lmFit
+fit <- lmFit(lcpmTMM, design)
+
+fit$coefficients
+
+contrast.matrix <- makeContrasts(
+  Unknown_0hvs_BG_4h    = `conditionUnknown_0h` - `conditionBG_4h`,
+  Unknown_0hvs_BG_24h   = `conditionUnknown_0h` - `conditionBG_24h`,
+  Unknown_0hvs_RPMI_4h  = `conditionUnknown_0h` - `conditionRPMI_4h`,
+  Unknown_0hvs_RPMI_24h = `conditionUnknown_0h` - `conditionRPMI_24h`,
+  levels = colnames(design)
+)
+fit.contr <- contrasts.fit(fit, contrast.matrix)
+
+
+# Aplicar corrección Bayesiana con eBayes
+fitBayes <- eBayes(fit.contr)
+# Extraer los genes diferencialmente expresados para la variable "Treatment"
+results_treatment <- topTable(fitBayes, coef = "Unknown_0hvs_RPMI_4h", number = Inf, adjust.method = "fdr")
+
+# Mostrar las primeras filas de los resultados
+head(results_treatment)
+
+# Guardar los resultados en archivos CSV
+write.csv(results_treatment, "DEA_Treatment_results.csv", row.names = TRUE)
+write.csv(results_time, "DEA_Time_results.csv", row.names = TRUE)
+
+```
+Cuantos son significativos
+```{r}
+n.degs <- results_treatment %>% filter(adj.P.Val <= 0.05) %>% nrow()
+n.degs
+```
+
+
+
+
+
+```{r}
+results_treatment %>% ggplot(aes(x = P.Value)) + 
+  geom_histogram(alpha = 0.8, color = "black") + 
+  geom_vline(xintercept = 0.05, color = "red", linetype = "dashed") + 
+  ggtitle(paste0("conditionUnknown_0h - conditionBG_4h (DEGs: ", n.degs, ")")) + 
+  theme_classic() + theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+logfc.cutoff <- 1
+results_treatment <- results_treatment %>% mutate(
+  SYMBOL = rownames(.),
+  Significant = case_when(
+    adj.P.Val <= 0.05 & logFC >= logfc.cutoff ~ "Up-regulated",
+    adj.P.Val <= 0.05 & logFC <= -logfc.cutoff ~ "Down-regulated",
+    TRUE ~ "Non-significant"
+  ) %>% factor(levels = c("Up-regulated", "Down-regulated", "Non-significant"))
+)
+results_treatment %>% ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) + 
+  geom_point(alpha = 0.8) + 
+  geom_vline(xintercept = logfc.cutoff, color = "red", linetype = "dashed") + 
+  geom_vline(xintercept = -logfc.cutoff, color = "red", linetype = "dashed") + 
+  geom_hline(yintercept = -log10(0.05), color = "red", linetype = "dashed") + 
+  scale_color_manual(values = c("#a83c32", "#3a6691", "#dbd9d9")) + 
+  ggtitle("conditionUnknown_0h - conditionBG_4h") + theme_classic() + 
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+Aquí trabajamos con el contraste `conditionUnknown_0h` - `conditionBG_24h`y hacemos histograma y volcano plot
+
+```{r}
+# Extraer los genes diferencialmente expresados para la variable "Treatment"
+results_treatment24 <- topTable(fitBayes, coef = "Unknown_0hvs_RPMI_24h", number = Inf, adjust.method = "fdr")
+
+# Mostrar las primeras filas de los resultados
+head(results_treatment24)
+```
+
+Cuantos son significativos
+
+```{r}
+n.degs24 <- results_treatment24 %>% filter(adj.P.Val <= 0.05) %>% nrow()
+n.degs24
+```
+
+
+
+
+
+```{r}
+results_treatment24 %>% ggplot(aes(x = P.Value)) + 
+  geom_histogram(alpha = 0.8, color = "black") + 
+  geom_vline(xintercept = 0.05, color = "red", linetype = "dashed") + 
+  ggtitle(paste0("conditionUnknown_0h - conditionBG_24h (DEGs: ", n.degs24, ")")) + 
+  theme_classic() + theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+logfc.cutoff <- 1
+results_treatment24 <- results_treatment24 %>% mutate(
+  SYMBOL = rownames(.),
+  Significant = case_when(
+    adj.P.Val <= 0.05 & logFC >= logfc.cutoff ~ "Up-regulated",
+    adj.P.Val <= 0.05 & logFC <= -logfc.cutoff ~ "Down-regulated",
+    TRUE ~ "Non-significant"
+  ) %>% factor(levels = c("Up-regulated", "Down-regulated", "Non-significant"))
+)
+results_treatment24 %>% ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) + 
+  geom_point(alpha = 0.8) + 
+  geom_vline(xintercept = logfc.cutoff, color = "red", linetype = "dashed") + 
+  geom_vline(xintercept = -logfc.cutoff, color = "red", linetype = "dashed") + 
+  geom_hline(yintercept = -log10(0.05), color = "red", linetype = "dashed") + 
+  scale_color_manual(values = c("#a83c32", "#3a6691", "#dbd9d9")) + 
+  ggtitle("conditionUnknown_0h - conditionBG_24h") + theme_classic() + 
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+Aquí usamos barplot para observar la expresión de los genes más significativos respecto a la condición
+
+```{r}
+top.tol.genes <- results_treatment24 %>% filter(adj.P.Val <= 0.05) %>% 
+  arrange(desc(logFC)) %>% pull(SYMBOL) %>% head()
+
+df.plot <- t(lcpmTMM[top.tol.genes, ]) %>% cbind(samplesMetadata) 
+top.tol.genes %>% lapply(
+  \(gene) {
+    df.plot %>% ggplot(
+      aes(x = condition, y = .data[[gene]], fill = condition)
+    ) + geom_boxplot() + 
+      geom_dotplot(binaxis = 'y', stackdir='center', dotsize=0.5) + 
+      ggtitle(paste0("Expression levels of ", gene, " gene")) + 
+      theme_classic() + theme(plot.title = element_text(face = "bold"))
+  }
+)
+```
+
+
+
+
+
+
+Análisis de enriquecimiento: descargamos las bases de datos de KEGG y MSIGDB
+
+```{r}
+genes <- suppressMessages(
+  AnnotationDbi::mapIds(
+    org.Hs.eg.db, 
+    keys = rownames(lcpmTMM), 
+    column = c("SYMBOL"),
+    keytype = "ENSEMBL", 
+    multiVals = 'first'
+  )
+)
+genesAnnoDbi <- stack(genes)
+colnames(genesAnnoDbi) <- c("SYMBOL", "GENE_ID")
+```
+
+
+
+```{r}
+tab <- getGeneKEGGLinks(species = "hsa")
+tab$Symbol <- mapIds(
+  org.Hs.eg.db, tab$GeneID,
+  column = "SYMBOL", keytype = "ENTREZID"
+) 
+```
+
+```{r}
+namesPathways <- getKEGGPathwayNames(species = "hsa")
+rownames(namesPathways) <- namesPathways$PathwayID
+listKegg <- split(tab, f = tab$PathwayID)
+names(listKegg) <- namesPathways[gsub(
+  pattern = "path:", replacement = "", x = names(listKegg)
+), "Description"] %>% gsub(
+  pattern = " - Homo sapiens (human)", replacement = "", x = ., fixed = T
+)
+listKeggmod <- lapply(listKegg, function(x) x[["Symbol"]])
+vec.length <- sapply(listKeggmod, length) 
+listKeggmod <- listKeggmod[vec.length > 5 & vec.length < 500]
+```
+
+```{r}
+names(listKeggmod) %>% head()
+```
+
+
+```{r}
+msigdb.hs <- getMsigdb(org = 'hs', id = 'SYM')
+```
+
+
+
+```{r}
+msigdb.hs.int.sets <- subsetCollection(
+  gsc = msigdb.hs, collection = c("h")
+)
+msigdb.hs.int.sets.list <- geneIds(msigdb.hs.int.sets)
+vec.length <- sapply(msigdb.hs.int.sets.list, length)
+keep <- vec.length > 5 & vec.length < 500
+msigdb.hs.int.sets.list.filt <- msigdb.hs.int.sets.list[keep]
+msigdb.hs.int.sets.list.df <- stack(msigdb.hs.int.sets.list.filt)[, c(2, 1)]
+```
+
+
+```{r}
+names(msigdb.hs.int.sets.list.filt) %>% head()
+```
+
+
+
+
+
+
+
+
+
+Del contraste de 0 a 4h sacamos los genes significativos con un valor del logFC mayor o igual que 1
+
+```{r}
+genes.0h.4h <- results_treatment %>% filter(adj.P.Val <= 0.05, logFC >= 1) %>% 
+  rownames()
+head(genes.0h.4h)
+```
+
+Del contraste de 0 a 24h sacamos los genes significativos con un valor del logFC mayor o igual que 1
+
+```{r}
+genes.0h.24h <- results_treatment24 %>%  filter(adj.P.Val <= 0.05, logFC >= 1) %>% 
+  rownames()
+head(genes.0h.24h)
+```
+
+
+
+
+
+
+Decidimos hacer enriquecimiento mediante ORA
+
+
+
+```{r}
+# Cargar biomaRt
+library(biomaRt)
+
+# Conectar con la base de datos de Ensembl
+
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Obtener la anotación de genes (ajusta las columnas según lo que necesites)
+bmAnnotations.filt <- getBM(
+  attributes = c("external_gene_name", "entrezgene_id"),
+  mart = mart
+)
+
+# Revisar si se ha cargado correctamente
+head(bmAnnotations.filt)
+
+```
+
+
+
+
+Aquí hacemos enriquecimiento por la base de datos KEGG
+
+```{r}
+library(clusterProfiler)
+library(enrichplot)
+
+
+# Convertir los genes de interés a ENTREZID
+genes_entrez_4h <- bitr(genes.0h.4h, fromType="ENSEMBL", toType="ENTREZID", OrgDb = org.Hs.eg.db)
+genes_entrez_24h <- bitr(genes.0h.24h, fromType="ENSEMBL", toType="ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Filtrar valores no nulos
+genes_entrez_4h <- na.omit(genes_entrez_4h)
+genes_entrez_24h <- na.omit(genes_entrez_24h)
+
+# Extraer solo la columna ENTREZID del data.frame generado por bitr()
+genes_entrez_4h <- genes_entrez_4h$ENTREZID
+genes_entrez_24h <- genes_entrez_24h$ENTREZID
+
+# ORA para KEGG
+# Realizar análisis de enriquecimiento KEGG con enrichKEGG
+kegg_enrich_4h <- enrichKEGG(gene = genes_entrez_4h, organism = "hsa", pvalueCutoff = 0.05)
+kegg_enrich_24h <- enrichKEGG(gene = genes_entrez_24h, organism = "hsa", pvalueCutoff = 0.05)
+
+# Visualizar resultados
+dotplot(kegg_enrich_4h, showCategory=10)
+dotplot(kegg_enrich_24h, showCategory=10)
+
+```
+
+
+
+
+
+Y aquí lo hacemos por la base de datos MSIGDB
+
+```{r}
+library(msigdbr)
+# Obtener los conjuntos de genes de MSigDB
+msigdb <- msigdbr(species = "Homo sapiens")
+
+# Filtrar el conjunto de genes de MSigDB para la colección que deseas (por ejemplo, colecciones 'H')
+msigdb_hallmark <- msigdb %>% filter(gs_cat == "H")
+
+msigdb_hallmark_list <- msigdb_hallmark %>%
+  group_by(gs_name) %>%
+  summarise(gene_list = list(entrez_gene))
+
+
+# Realizar el análisis de enriquecimiento con MSigDB
+ora_msigdb_4h <- enricher(genes_entrez_4h, TERM2GENE = msigdb_hallmark_list, pvalueCutoff = 0.05)
+ora_msigdb_24h <- enricher(genes_entrez_24h, TERM2GENE = msigdb_hallmark_list, pvalueCutoff = 0.05)
+
+
+# Visualizar resultados con dotplot
+dotplot(ora_msigdb_4h, showCategory = 10)
+dotplot(ora_msigdb_24h, showCategory = 10)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
